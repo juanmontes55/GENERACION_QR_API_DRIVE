@@ -1,0 +1,156 @@
+import pandas as pd
+import qrcode
+from PIL import Image, ImageDraw, ImageFont
+import os
+import re
+from unidecode import unidecode
+
+# --- Google Drive ---
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+
+# ---------- CONFIGURACIÓN ----------
+# ID de la carpeta en Google Drive (solo el ID, no toda la URL)
+carpeta_id = ""
+
+# Ruta del archivo Excel con los equipos
+excel_file = r""   # <- cambia aquí si tu archivo está en otra ruta
+
+# Carpeta local donde se guardarán las etiquetas QR generadas
+os.makedirs("./etiquetas_qr", exist_ok=True)
+
+# Rutas de credenciales
+TOKEN_PATH = r"./token.json"           # <- aquí se guardará el token generado automáticamente
+CREDENTIALS_PATH = r"./credentials.json"  # <- archivo descargado desde Google Cloud Console
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+# ---------- AUTENTICACIÓN ----------
+creds = None
+if os.path.exists(TOKEN_PATH):
+    creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+
+if not creds or not creds.valid:
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+        creds = flow.run_local_server(port=0)
+    # Guardar credenciales
+    with open(TOKEN_PATH, "w") as token:
+        token.write(creds.to_json())
+
+service = build("drive", "v3", credentials=creds)
+
+# ---------- FUNCIONES ----------
+def normalizar(texto):
+    """
+    Convierte a minúsculas, elimina tildes,
+    signos de puntuación y espacios extras.
+    """
+    texto = str(texto).lower()
+    texto = unidecode(texto)             # quita acentos
+    texto = re.sub(r"[^a-z0-9]", "", texto)  # deja solo letras y números
+    return texto
+
+def buscar_pdf(nombre, marca, modelo):
+    """
+    Busca un PDF en Drive con validación por etapas:
+    1. nombre + marca + modelo
+    2. nombre + marca
+    3. nombre + modelo
+    4. solo nombre
+    5. marca + modelo
+    """
+    query = f"'{carpeta_id}' in parents and mimeType='application/pdf'"
+    results = service.files().list(
+        q=query,
+        fields="files(id, name)"
+    ).execute()
+
+    archivos = results.get("files", [])
+
+    nombre_norm = normalizar(nombre)
+    marca_norm = normalizar(marca)
+    modelo_norm = normalizar(modelo)
+
+    # Etapa 1: nombre + marca + modelo
+    for archivo in archivos:
+        titulo_norm = normalizar(archivo.get("name"))
+        if nombre_norm in titulo_norm and marca_norm in titulo_norm and modelo_norm in titulo_norm:
+            return f"https://drive.google.com/file/d/{archivo['id']}/view"
+
+    # Etapa 2: nombre + marca
+    for archivo in archivos:
+        titulo_norm = normalizar(archivo.get("name"))
+        if nombre_norm in titulo_norm and marca_norm in titulo_norm:
+            return f"https://drive.google.com/file/d/{archivo['id']}/view"
+
+    # Etapa 3: nombre + modelo
+    for archivo in archivos:
+        titulo_norm = normalizar(archivo.get("name"))
+        if nombre_norm in titulo_norm and modelo_norm in titulo_norm:
+            return f"https://drive.google.com/file/d/{archivo['id']}/view"
+
+    # Etapa 4: solo nombre
+    for archivo in archivos:
+        titulo_norm = normalizar(archivo.get("name"))
+        if nombre_norm in titulo_norm:
+            return f"https://drive.google.com/file/d/{archivo['id']}/view"
+
+    # Etapa 5: marca + modelo
+    for archivo in archivos:
+        titulo_norm = normalizar(archivo.get("name"))
+        if marca_norm in titulo_norm and modelo_norm in titulo_norm:
+            return f"https://drive.google.com/file/d/{archivo['id']}/view"
+
+    return None
+
+# ---------- PROCESO ----------
+df = pd.read_excel(excel_file)
+
+# Fuente para texto
+try:
+    font = ImageFont.truetype("arial.ttf", 24)
+except:
+    font = ImageFont.load_default()
+
+for _, row in df.iterrows():
+    nombre = str(row["NOMBRE DEL EQUIPO"])
+    marca = str(row["MARCA"])
+    modelo = str(row["MODELO"])
+
+    # Buscar PDF correspondiente
+    link = buscar_pdf(nombre, marca, modelo)
+    if not link:
+        print(f"⚠️ No se encontró guía para {nombre} ({marca} {modelo})")
+        continue
+
+    # Generar QR con el link
+    qr = qrcode.make(link).convert("RGB")
+
+    # Hacer lienzo más grande para el texto
+    w, h = qr.size
+    extra_w = 100  # margen horizontal
+    extra_h = 120  # espacio para texto debajo
+    new_img = Image.new("RGB", (w + extra_w, h + extra_h), "white")
+    new_img.paste(qr, (extra_w // 2, 0))  # centrado
+
+    # Texto debajo del QR
+    texto = f"{nombre}\nMarca: {marca} | Modelo: {modelo}"
+    draw = ImageDraw.Draw(new_img)
+    y_offset = h + 10
+    for linea in texto.split("\n"):
+        bbox = draw.textbbox((0, 0), linea, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        draw.text(((new_img.width - text_w) / 2, y_offset), linea, fill="black", font=font)
+        y_offset += text_h + 5
+
+    # Guardar la etiqueta
+    safe_name = re.sub(r"[\\/*?:\"<>|]", "_", f"{nombre}_{marca}_{modelo}")
+    filename = f"./etiquetas_qr/{safe_name}.png"
+    new_img.save(filename)
+
+print("✅ Todas las etiquetas QR fueron generadas en 'etiquetas_qr'")
